@@ -6,18 +6,21 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 
-	"github.com/rancher/logserver/pkg/foo"
-	"github.com/rancher/logserver/pkg/generated/controllers/some.api.group"
-	"github.com/rancher/wrangler/pkg/resolvehome"
+	"k8s.io/client-go/rest"
+
+	"github.com/gorilla/mux"
 	"github.com/rancher/wrangler/pkg/signals"
-	"github.com/rancher/wrangler/pkg/start"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
-	"k8s.io/client-go/tools/clientcmd"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
 
 var (
@@ -27,21 +30,10 @@ var (
 
 func main() {
 	app := cli.NewApp()
-	app.Name = "testy"
+	app.Name = "log-server"
 	app.Version = fmt.Sprintf("%s (%s)", Version, GitCommit)
 	app.Usage = "testy needs help!"
-	app.Flags = []cli.Flag{
-		cli.StringFlag{
-			Name:   "kubeconfig",
-			EnvVar: "KUBECONFIG",
-			Value:  "${HOME}/.kube/config",
-		},
-		cli.StringFlag{
-			Name:   "masterurl",
-			EnvVar: "MASTERURL",
-			Value:  "",
-		},
-	}
+	app.Flags = []cli.Flag{}
 	app.Action = run
 
 	if err := app.Run(os.Args); err != nil {
@@ -49,33 +41,75 @@ func main() {
 	}
 }
 
-func run(c *cli.Context) {
-	flag.Parse()
+type handler struct {
+	core corev1.CoreV1Interface
+}
 
-	logrus.Info("Starting controller")
+func (h handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	parts := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
+
+	if len(parts) != 3 {
+		rw.WriteHeader(http.StatusUnprocessableEntity)
+		rw.Write([]byte("invalid request path"))
+		return
+	}
+
+	ns, name := parts[1], parts[2]
+	pods, err := h.core.Pods(ns).List(metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("service-namespace=%s,service-name=%s", ns, name),
+	})
+	if err != nil {
+		rw.WriteHeader(http.StatusInternalServerError)
+		rw.Write([]byte(err.Error()))
+		return
+	}
+
+	if len(pods.Items) == 0 {
+		return
+	}
+
+	pod := pods.Items[0]
+	logReq := h.core.Pods(pod.Namespace).GetLogs(pod.Name, &v1.PodLogOptions{
+		Follow:    true,
+		Container: "build-step-build-and-push",
+	})
+
+	reader, err := logReq.Stream()
+	if err != nil {
+		rw.WriteHeader(http.StatusInternalServerError)
+		rw.Write([]byte(err.Error()))
+		return
+	}
+	defer reader.Close()
+
+	if _, err := io.Copy(rw, reader); err != nil {
+		rw.WriteHeader(http.StatusInternalServerError)
+		rw.Write([]byte(err.Error()))
+		return
+	}
+}
+
+func run(c *cli.Context) error {
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return err
+	}
+
+	core, err := corev1.NewForConfig(restConfig)
+	if err != nil {
+		return err
+	}
+
+	h := handler{
+		core: core,
+	}
+
 	ctx := signals.SetupSignalHandler(context.Background())
-
-	kubeconfig, err := resolvehome.Resolve(c.String("kubeconfig"))
-	if err != nil {
-		logrus.Fatalf("Error resolving home dir: %s", err.Error())
+	root := mux.NewRouter()
+	root.PathPrefix("/logs").Handler(h)
+	if err := http.ListenAndServe(":8080", root); err != nil {
+		logrus.Fatalf("Failed to listen on %s: %v", "8080", err)
 	}
-	masterurl := c.String("masterurl")
-
-	cfg, err := clientcmd.BuildConfigFromFlags(masterurl, kubeconfig)
-	if err != nil {
-		logrus.Fatalf("Error building kubeconfig: %s", err.Error())
-	}
-
-	foos, err := some.NewFactoryFromConfig(cfg)
-	if err != nil {
-		logrus.Fatalf("Error building sample controllers: %s", err.Error())
-	}
-
-	foo.Register(ctx, foos.Some().V1().Foo())
-
-	if err := start.All(ctx, 2, foos); err != nil {
-		logrus.Fatalf("Error starting: %s", err.Error())
-	}
-
 	<-ctx.Done()
+	return nil
 }
